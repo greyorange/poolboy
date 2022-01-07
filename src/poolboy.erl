@@ -3,7 +3,7 @@
 -module(poolboy).
 -behaviour(gen_server).
 
--export([checkout/1, checkout/2, checkout/3, checkin/2, transaction/2,
+-export([checkout/1, checkout/2, checkout/3, get_avail_workers/1, checkin/2, transaction/2,
          transaction/3, child_spec/2, child_spec/3, start/1, start/2,
          start_link/1, start_link/2, stop/1, status/1]).
 -export([init/1, handle_call/3, handle_cast/2, handle_info/2, terminate/2,
@@ -41,11 +41,18 @@
     workers = [] :: [pid()],
     waiting :: pid_queue(),
     monitors :: ets:tid(),
+    workers_ets_name :: undefined | atom,
     size = 5 :: non_neg_integer(),
     overflow = 0 :: non_neg_integer(),
     max_overflow = 10 :: non_neg_integer(),
     strategy = lifo :: lifo | fifo
 }).
+
+-spec get_avail_workers(Pool :: pool()) -> list(pid()).
+get_avail_workers(PoolName) ->
+    ETSName = list_to_atom(atom_to_list(PoolName) ++ "_workers"),
+    [{pids, Pids}] = ets:lookup(ETSName, pids),
+    Pids.
 
 -spec checkout(Pool :: pool()) -> pid().
 checkout(Pool) ->
@@ -134,7 +141,17 @@ init({PoolArgs, WorkerArgs}) ->
     process_flag(trap_exit, true),
     Waiting = queue:new(),
     Monitors = ets:new(monitors, [private]),
-    init(PoolArgs, WorkerArgs, #state{waiting = Waiting, monitors = Monitors}).
+    WorkersPublicETSName =
+        case proplists:get_value(name, PoolArgs) of
+            {_, Name} when is_atom(Name) ->
+                FinalWEtsName = list_to_atom(atom_to_list(Name) ++ "_workers"),
+                ets:new(FinalWEtsName, [public, set, named_table, {read_concurrency, true}]),
+                FinalWEtsName;
+            _ -> undefined  
+        end,
+    init(PoolArgs, WorkerArgs,
+        #state{waiting = Waiting, monitors = Monitors,
+                workers_ets_name = WorkersPublicETSName}).
 
 init([{worker_module, Mod} | Rest], WorkerArgs, State) when is_atom(Mod) ->
     {ok, Sup} = poolboy_sup:start_link(Mod, WorkerArgs),
@@ -149,8 +166,14 @@ init([{strategy, fifo} | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State#state{strategy = fifo});
 init([_ | Rest], WorkerArgs, State) ->
     init(Rest, WorkerArgs, State);
-init([], _WorkerArgs, #state{size = Size, supervisor = Sup} = State) ->
+init([], _WorkerArgs,
+        #state{workers_ets_name = WorkersPublicETSName, size = Size, supervisor = Sup} = State) ->
     Workers = prepopulate(Size, Sup),
+    case WorkersPublicETSName of
+        undefined -> ok;
+        _ ->
+            true = ets:insert(WorkersPublicETSName, {pids, Workers})
+    end,
     {ok, State#state{workers = Workers}}.
 
 handle_cast({checkin, Pid}, State = #state{monitors = Monitors}) ->
@@ -190,11 +213,17 @@ handle_call({checkout, CRef, Block}, {FromPid, _} = From, State) ->
            workers = Workers,
            monitors = Monitors,
            overflow = Overflow,
+           workers_ets_name = WorkersPublicETSName,
            max_overflow = MaxOverflow} = State,
     case Workers of
         [Pid | Left] ->
             MRef = erlang:monitor(process, FromPid),
             true = ets:insert(Monitors, {Pid, CRef, MRef}),
+            case WorkersPublicETSName of
+                undefined -> ok;
+                _ ->
+                    true = ets:insert(WorkersPublicETSName, {pids, Left})
+            end,
             {reply, Pid, State#state{workers = Left}};
         [] when MaxOverflow > 0, Overflow < MaxOverflow ->
             {Pid, MRef} = new_worker(Sup, FromPid),
@@ -243,6 +272,7 @@ handle_info({'DOWN', MRef, _, _, _}, State) ->
     end;
 handle_info({'EXIT', Pid, _Reason}, State) ->
     #state{supervisor = Sup,
+           workers_ets_name = WorkersPublicETSName,
            monitors = Monitors} = State,
     case ets:lookup(Monitors, Pid) of
         [{Pid, _, MRef}] ->
@@ -254,7 +284,13 @@ handle_info({'EXIT', Pid, _Reason}, State) ->
             case lists:member(Pid, State#state.workers) of
                 true ->
                     W = lists:filter(fun (P) -> P =/= Pid end, State#state.workers),
-                    {noreply, State#state{workers = [new_worker(Sup) | W]}};
+                    UpdatedWorkers = [new_worker(Sup) | W],
+                    case WorkersPublicETSName of
+                        undefined -> ok;
+                        _ ->
+                            true = ets:insert(WorkersPublicETSName, {pids, UpdatedWorkers})
+                    end,
+                    {noreply, State#state{workers = UpdatedWorkers}};
                 false ->
                     {noreply, State}
             end
@@ -308,6 +344,7 @@ handle_checkin(Pid, State) ->
            waiting = Waiting,
            monitors = Monitors,
            overflow = Overflow,
+           workers_ets_name = WorkersPublicETSName,
            strategy = Strategy} = State,
     case queue:out(Waiting) of
         {{value, {From, CRef, MRef}}, Left} ->
@@ -322,12 +359,18 @@ handle_checkin(Pid, State) ->
                 lifo -> [Pid | State#state.workers];
                 fifo -> State#state.workers ++ [Pid]
             end,
+            case WorkersPublicETSName of
+                undefined -> ok;
+                _ ->
+                    true = ets:insert(WorkersPublicETSName, {pids, Workers})
+            end,
             State#state{workers = Workers, waiting = Empty, overflow = 0}
     end.
 
 handle_worker_exit(Pid, State) ->
     #state{supervisor = Sup,
            monitors = Monitors,
+           workers_ets_name = WorkersPublicETSName,
            overflow = Overflow} = State,
     case queue:out(State#state.waiting) of
         {{value, {From, CRef, MRef}}, LeftWaiting} ->
@@ -341,6 +384,11 @@ handle_worker_exit(Pid, State) ->
             Workers =
                 [new_worker(Sup)
                  | lists:filter(fun (P) -> P =/= Pid end, State#state.workers)],
+            case WorkersPublicETSName of
+                undefined -> ok;
+                _ ->
+                    true = ets:insert(WorkersPublicETSName, {pids, Workers})
+            end,
             State#state{workers = Workers, waiting = Empty}
     end.
 
